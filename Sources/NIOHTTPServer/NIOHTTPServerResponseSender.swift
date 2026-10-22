@@ -19,7 +19,8 @@ import Synchronization
 @available(anyAppleOS 27.0, *)
 extension NIOHTTPServer {
     public struct ResponseSender: HTTPResponseSender, ~Copyable {
-        let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
+        /// The channel's writer. `nil` for HTTP/3 on the lightweight HTTP/3 streams, which writes to ``lightweightHTTP3Request``.
+        let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>?
         let writerState: WriterState
 
         // Initializes a new response sender.
@@ -30,6 +31,17 @@ extension NIOHTTPServer {
             self.writer = writer
             self.writerState = writerState
         }
+
+        #if HTTP3
+        /// The request stream, for HTTP/3 on the lightweight HTTP/3 streams.
+        var lightweightHTTP3Request: LightweightHTTP3Request?
+
+        init(lightweightHTTP3Request: LightweightHTTP3Request) {
+            self.writer = nil
+            self.writerState = WriterState()
+            self.lightweightHTTP3Request = lightweightHTTP3Request
+        }
+        #endif
 
         #if HTTP3 && UnstableHTTPDatagrams
         private var datagramStreamFuture: EventLoopFuture<HTTP3UnreliableDatagramStream>?
@@ -49,21 +61,33 @@ extension NIOHTTPServer {
 
         public mutating func sendInformational(_ response: HTTPResponse) async throws {
             precondition(response.status.kind == .informational)
-            try await self.writer.write(.head(response))
+            #if HTTP3
+            if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                try lightweightHTTP3Request.sendInformational(response)
+                return
+            }
+            #endif
+            try await self.writer!.write(.head(response))
         }
 
         public consuming func send(_ response: HTTPResponse) async throws -> sending Writer {
             precondition(response.status.kind != .informational)
-            try await self.writer.write(.head(response))
+            #if HTTP3
+            if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                try lightweightHTTP3Request.sendHead(response)
+                return Writer(lightweightHTTP3Request: lightweightHTTP3Request, writerState: self.writerState)
+            }
+            #endif
+            try await self.writer!.write(.head(response))
 
             #if HTTP3 && UnstableHTTPDatagrams
             return Writer(
-                writer: self.writer,
+                writer: self.writer!,
                 writerState: self.writerState,
                 datagramStreamFuture: self.datagramStreamFuture
             )
             #else
-            return Writer(writer: self.writer, writerState: self.writerState)
+            return Writer(writer: self.writer!, writerState: self.writerState)
             #endif
         }
 
@@ -73,11 +97,22 @@ extension NIOHTTPServer {
             trailer: HTTPFields? = nil
         ) async throws where Buffer: RangeReplaceableContainer, Buffer.Element == UInt8, Buffer: ~Copyable {
             precondition(response.status.kind != .informational)
+            #if HTTP3
+            if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                try lightweightHTTP3Request.sendHead(response)
+                if !buffer.isEmpty {
+                    try lightweightHTTP3Request.write(ByteBuffer(draining: &buffer))
+                }
+                try lightweightHTTP3Request.finish(trailers: trailer)
+                self.writerState.wrapped.withLock { $0.finishedWriting = true }
+                return
+            }
+            #endif
             if buffer.isEmpty {
-                try await self.writer.write(contentsOf: [.head(response), .end(trailer)])
+                try await self.writer!.write(contentsOf: [.head(response), .end(trailer)])
             } else {
                 let body = ByteBuffer(draining: &buffer)
-                try await self.writer.write(contentsOf: [.head(response), .body(body), .end(trailer)])
+                try await self.writer!.write(contentsOf: [.head(response), .body(body), .end(trailer)])
             }
             self.writerState.wrapped.withLock { $0.finishedWriting = true }
         }
@@ -101,8 +136,8 @@ extension NIOHTTPServer.ResponseSender {
 
         public typealias FinalElement = HTTPFields?
 
-        /// The underlying NIO writer for HTTP response parts.
-        let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
+        /// The underlying NIO writer for HTTP response parts. `nil` for HTTP/3 on the lightweight HTTP/3 streams.
+        let writer: NIOAsyncChannelOutboundWriter<HTTPResponsePart>?
 
         let writerState: WriterState
 
@@ -113,6 +148,17 @@ extension NIOHTTPServer.ResponseSender {
             self.writer = writer
             self.writerState = writerState
         }
+
+        #if HTTP3
+        /// The request stream, for HTTP/3 on the lightweight HTTP/3 streams.
+        var lightweightHTTP3Request: LightweightHTTP3Request?
+
+        init(lightweightHTTP3Request: LightweightHTTP3Request, writerState: WriterState) {
+            self.writer = nil
+            self.writerState = writerState
+            self.lightweightHTTP3Request = lightweightHTTP3Request
+        }
+        #endif
 
         #if HTTP3 && UnstableHTTPDatagrams
         /// The unreliable datagram writer, present when the underlying transport supports unreliable datagrams.
@@ -132,17 +178,33 @@ extension NIOHTTPServer.ResponseSender {
         public mutating func write(
             buffer: inout some RangeReplaceableContainer<UInt8> & ~Copyable
         ) async throws(WriteFailure) {
-            try await self.writer.write(.body(ByteBuffer(draining: &buffer)))
+            #if HTTP3
+            if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                try lightweightHTTP3Request.write(ByteBuffer(draining: &buffer))
+                return
+            }
+            #endif
+            try await self.writer!.write(.body(ByteBuffer(draining: &buffer)))
         }
 
         public consuming func finish(
             buffer: inout some RangeReplaceableContainer<UInt8> & ~Copyable,
             finalElement: consuming HTTPFields?
         ) async throws(WriteFailure) {
-            if !buffer.isEmpty {
-                try await self.writer.write(.body(ByteBuffer(draining: &buffer)))
+            #if HTTP3
+            if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                if !buffer.isEmpty {
+                    try lightweightHTTP3Request.write(ByteBuffer(draining: &buffer))
+                }
+                try lightweightHTTP3Request.finish(trailers: finalElement)
+                self.writerState.wrapped.withLock { $0.finishedWriting = true }
+                return
             }
-            try await self.writer.write(.end(finalElement))
+            #endif
+            if !buffer.isEmpty {
+                try await self.writer!.write(.body(ByteBuffer(draining: &buffer)))
+            }
+            try await self.writer!.write(.end(finalElement))
             self.writerState.wrapped.withLock { $0.finishedWriting = true }
         }
 

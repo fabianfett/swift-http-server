@@ -39,6 +39,11 @@ extension NIOHTTPServer {
                 self.wrapped = .init(.init(iterator: Disconnected(value: iterator)))
             }
 
+            /// A state without an iterator, for requests which don't come from a channel.
+            init() {
+                self.wrapped = .init(.init(iterator: Disconnected(value: nil)))
+            }
+
             /// Takes the iterator out of the state. Returns the iterator if present,
             /// or `nil` if it's already been taken (e.g. by the body reader).
             func takeIterator() -> sending NIOAsyncChannelInboundStream<HTTPRequestPart>.AsyncIterator? {
@@ -91,12 +96,32 @@ extension NIOHTTPServer {
         }
         #endif
 
+        #if HTTP3
+        /// The request stream, for HTTP/3 on the lightweight HTTP/3 streams.
+        private var lightweightHTTP3Request: LightweightHTTP3Request?
+
+        init(lightweightHTTP3Request: LightweightHTTP3Request) {
+            self.state = ReaderState()
+            self.iterator = nil
+            self.buffer = UniqueArray<UInt8>()
+            self.lightweightHTTP3Request = lightweightHTTP3Request
+        }
+        #endif
+
         public mutating func read<Return: ~Copyable, Failure: Error>(
             body: (inout Buffer, consuming HTTPFields??) async throws(Failure) -> Return
         ) async throws(EitherError<ReadFailure, Failure>) -> Return {
             let requestPart: HTTPRequestPart?
             do {
+                #if HTTP3
+                if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                    requestPart = try await lightweightHTTP3Request.read()
+                } else {
+                    requestPart = try await self.iterator?.next(isolation: #isolation)
+                }
+                #else
                 requestPart = try await self.iterator?.next(isolation: #isolation)
+                #endif
             } catch {
                 throw .first(error)
             }

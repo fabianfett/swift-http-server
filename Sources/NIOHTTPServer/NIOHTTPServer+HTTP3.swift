@@ -230,6 +230,26 @@ extension NIOHTTPServer {
         addressContinuation: AsyncThrowingStream<NIOCore.SocketAddress, any Error>.Continuation,
         connectionHandler: Handler
     ) {
+        // PROTOTYPE: serve HTTP/3 on the lightweight HTTP/3 streams, unless HTTP datagrams are needed, which they
+        // don't support.
+        #if UnstableHTTPDatagrams
+        let useLightweight = configuration.http3Configuration.datagramConfiguration == nil
+        #else
+        let useLightweight = true
+        #endif
+        if useLightweight {
+            self.addLightweightHTTP3Listener(
+                to: &group,
+                address: address,
+                eventLoop: eventLoop,
+                socket: socket,
+                configuration: configuration,
+                addressContinuation: addressContinuation,
+                connectionHandler: connectionHandler
+            )
+            return
+        }
+
         let executor = eventLoop as? any TaskExecutor
         group.addTask(name: "HTTP/3 over \(address) on \(eventLoop)", executorPreference: executor) {
             try await self.withHTTP3Channel(
