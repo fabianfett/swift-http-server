@@ -306,7 +306,7 @@ public struct NIOHTTPServer: HTTPServer {
     /// Shared core: invokes the request handler with the appropriate reader/writer state.
     /// Returns the recovered iterator if the request was fully consumed (for HTTP/1.1 reuse),
     /// or `nil` if the request could not be fully consumed.
-    private func invokeHandler<Handler: HTTPServerRequestHandler>(
+    func invokeHandler<Handler: HTTPServerRequestHandler>(
         request: HTTPRequest,
         requestContext: RequestContext,
         requestReader: consuming sending Reader,

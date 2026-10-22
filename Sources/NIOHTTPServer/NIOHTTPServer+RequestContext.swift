@@ -40,6 +40,17 @@ extension NIOHTTPServer {
             self.connectionContext = connectionContext
             self.channel = channel
         }
+
+        #if HTTP3
+        /// The request stream, for HTTP/3 on the lightweight HTTP/3 streams: ``channel`` is the connection's channel then.
+        var lightweightHTTP3Request: LightweightHTTP3Request?
+
+        init(connectionContext: ConnectionContext, channel: any Channel, lightweightHTTP3Request: LightweightHTTP3Request) {
+            self.connectionContext = connectionContext
+            self.channel = channel
+            self.lightweightHTTP3Request = lightweightHTTP3Request
+        }
+        #endif
     }
 }
 
