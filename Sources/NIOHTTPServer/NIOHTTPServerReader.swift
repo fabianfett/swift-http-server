@@ -86,12 +86,35 @@ extension NIOHTTPServer {
         }
         #endif
 
+        #if HTTP3
+        /// The request stream, for HTTP/3 on the lightweight HTTP/3 streams.
+        private var lightweightHTTP3Request: LightweightHTTP3Request?
+
+        init(lightweightHTTP3Request: LightweightHTTP3Request) {
+            // Unused: the request stream tracks its own read state.
+            self.state = .finished
+            self.buffer = UniqueArray<UInt8>()
+            self.lightweightHTTP3Request = lightweightHTTP3Request
+        }
+        #endif
+
         public mutating func read<Return: ~Copyable, Failure: Error>(
             body: (inout Buffer, consuming HTTPFields??) async throws(Failure) -> Return
         ) async throws(EitherError<ReadFailure, Failure>) -> Return {
             let requestPart: HTTPRequestPart
             do {
+                #if HTTP3
+                if let lightweightHTTP3Request = self.lightweightHTTP3Request {
+                    guard let part = try await lightweightHTTP3Request.read() else {
+                        throw RequestBodyReadError.readAfterRequestEnd
+                    }
+                    requestPart = part
+                } else {
+                    requestPart = try await self.state.nextRequestPart(isolation: #isolation)
+                }
+                #else
                 requestPart = try await self.state.nextRequestPart(isolation: #isolation)
+                #endif
             } catch {
                 throw .first(error)
             }

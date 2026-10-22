@@ -62,6 +62,11 @@ extension NIOHTTPServer {
             let resetCode = Self.quicErrorCode(http3Error?.http3StreamResetCode)
             let stopSendingCode = Self.quicErrorCode(http3Error?.http3StopSendingCode)
 
+            if let request = requestContext.lightweightHTTP3Request {
+                request.abort(resetCode: resetCode, stopSendingCode: stopSendingCode)
+                return
+            }
+
             // `RESET_STREAM` abandons the response direction and `STOP_SENDING` asks the client to
             // stop sending the request body.
             channel.triggerUserOutboundEvent(QUICResetStreamEvent(code: resetCode), promise: nil)

@@ -53,6 +53,9 @@ extension NIOHTTPServer {
 
             #if HTTP3
             case http3(connection: HTTP3ServerConnection<NIOHTTPServer.HTTP3Stream, NIOQUIC.QUICStreamCreator>)
+
+            /// HTTP/3 on the lightweight HTTP/3 streams, without a channel per request stream.
+            case lightweightHTTP3(connection: LightweightHTTP3Connection)
             #endif
         }
 
@@ -109,6 +112,9 @@ extension NIOHTTPServer {
             #if HTTP3
             case .http3(let connection):
                 await server.handleHTTP3Connection(connection: connection, handler: handler, context: context)
+
+            case .lightweightHTTP3(let connection):
+                await server.handleLightweightHTTP3Connection(connection: connection, handler: handler, context: context)
             #endif
             }
         }

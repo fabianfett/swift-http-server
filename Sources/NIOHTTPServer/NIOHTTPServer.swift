@@ -308,7 +308,7 @@ public struct NIOHTTPServer: HTTPServer {
     /// - Parameters:
     ///   - exchangeState: The state shared by `requestReader` and `responseSender`.
     /// - Returns: `true` if the handler returned without throwing and concluded the response; `false` otherwise.
-    private func invokeHandler<Handler: HTTPServerRequestHandler>(
+    func invokeHandler<Handler: HTTPServerRequestHandler>(
         request: HTTPRequest,
         requestContext: RequestContext,
         exchangeState: ExchangeState,
