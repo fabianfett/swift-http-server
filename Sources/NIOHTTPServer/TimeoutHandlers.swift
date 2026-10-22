@@ -159,9 +159,8 @@ final class RequestTimeoutHandler: ChannelDuplexHandler, RemovableChannelHandler
     }
 
     func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
-        let part = self.unwrapOutboundIn(data)
         context.write(data, promise: promise)
-        if case .end = part {
+        if case .end = self.unwrapOutboundIn(data) {
             self.responseEnded = true
             self.rescheduleHeaderTimeoutIfRequestCompleted(context: context)
         }
