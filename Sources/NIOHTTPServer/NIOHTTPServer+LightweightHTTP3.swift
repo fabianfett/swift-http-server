@@ -17,8 +17,10 @@
 //
 // - Request streams are served by one `HTTP3ServerConsumer` per connection. It hands each request head to the
 //   connection's task, which runs the request handler in a child task, like the channel-based path does.
-// - All of it runs on the listener's event loop: the tasks prefer an `EventLoopTaskExecutor`, so the handler
-//   touches its stream directly, with no hops to and from the event loop.
+// - The tasks prefer the listener's event loop as their `TaskExecutor`, if it is one: then the handler touches its
+//   stream directly, with no hops to and from the event loop. Otherwise they run on the global concurrent executor,
+//   and hop to the event loop to touch the stream. The state the consumer and the handler share is behind a lock,
+//   so both work.
 // - Response parts are gathered and sent together: a response that's written in one go leaves in one flush,
 //   so in one set of packets.
 //
@@ -36,71 +38,77 @@ import NIOPosix
 import NIOQUIC
 import NIOQUICHelpers
 import ServiceLifecycle
+import Synchronization
 
-/// Runs jobs on a NIO event loop.
+/// A single consumer queue: the producer is the event loop, the consumer a task which runs anywhere.
 @available(anyAppleOS 27.0, *)
-final class EventLoopTaskExecutor: TaskExecutor, @unchecked Sendable {
-    let eventLoop: any EventLoop
-
-    init(eventLoop: any EventLoop) {
-        self.eventLoop = eventLoop
+final class LightweightHTTP3Queue<Element: Sendable>: Sendable {
+    private struct State {
+        var pending = CircularBuffer<Element>()
+        var waiter: UnsafeContinuation<Element?, Never>?
+        var isFinished = false
     }
 
-    func enqueue(_ job: consuming ExecutorJob) {
-        let job = UnownedJob(job)
-        self.eventLoop.execute {
-            job.runSynchronously(on: self.asUnownedTaskExecutor())
-        }
-    }
-}
+    private let state = Mutex(State())
 
-/// A single consumer queue, confined to an event loop: the producer is the event loop, the consumer a task which
-/// runs on it.
-@available(anyAppleOS 27.0, *)
-final class LightweightHTTP3Queue<Element: Sendable>: @unchecked Sendable {
-    private let eventLoop: any EventLoop
-    private var pending = CircularBuffer<Element>()
-    private var waiter: UnsafeContinuation<Element?, Never>?
-    private var isFinished = false
-
-    init(eventLoop: any EventLoop) {
-        self.eventLoop = eventLoop
-    }
+    init() {}
 
     func yield(_ element: Element) {
-        self.eventLoop.assertInEventLoop()
-        if let waiter = self.waiter.take() {
-            waiter.resume(returning: element)
-        } else {
-            self.pending.append(element)
+        let waiter = self.state.withLock { state -> UnsafeContinuation<Element?, Never>? in
+            if let waiter = state.waiter.take() {
+                return waiter
+            }
+            state.pending.append(element)
+            return nil
         }
+        waiter?.resume(returning: element)
     }
 
     func finish() {
-        self.eventLoop.assertInEventLoop()
-        self.isFinished = true
-        self.waiter.take()?.resume(returning: nil)
+        let waiter = self.state.withLock { state in
+            state.isFinished = true
+            return state.waiter.take()
+        }
+        waiter?.resume(returning: nil)
     }
 
-    /// The next element, or `nil` once the queue is finished. Must be called on the event loop.
+    /// The next element, or `nil` once the queue is finished.
     func next() async -> Element? {
-        self.eventLoop.assertInEventLoop()
-        if let element = self.pending.popFirst() {
-            return element
-        }
-        if self.isFinished {
+        let next = self.state.withLock { state -> Element?? in
+            if let element = state.pending.popFirst() {
+                return element
+            }
+            if state.isFinished {
+                return .some(nil)
+            }
             return nil
         }
+        if let next {
+            return next
+        }
         return await withUnsafeContinuation { continuation in
-            self.waiter = continuation
+            let next = self.state.withLock { state -> Element?? in
+                if let element = state.pending.popFirst() {
+                    return element
+                }
+                if state.isFinished {
+                    return .some(nil)
+                }
+                precondition(state.waiter == nil, "\(Self.self) only has a single consumer")
+                state.waiter = continuation
+                return nil
+            }
+            if let next {
+                continuation.resume(returning: next)
+            }
         }
     }
 }
 
 /// One HTTP/3 connection served on the lightweight HTTP/3 streams.
 @available(anyAppleOS 27.0, *)
-final class LightweightHTTP3Connection: @unchecked Sendable {
-    struct InboundRequest: @unchecked Sendable {
+final class LightweightHTTP3Connection: Sendable {
+    struct InboundRequest: Sendable {
         var head: HTTPRequest
         var stream: LightweightHTTP3Request
     }
@@ -108,55 +116,102 @@ final class LightweightHTTP3Connection: @unchecked Sendable {
     let eventLoop: any EventLoop
     let channel: any Channel
     let requests: LightweightHTTP3Queue<InboundRequest>
-    /// Set once the consumer exists, which is right after this.
-    var http3Connection: HTTP3Connection<LightweightHTTP3Consumer>!
+    /// Only usable on ``eventLoop``.
+    let http3Connection: NIOLoopBound<HTTP3Connection<LightweightHTTP3Consumer>>
 
-    init(channel: any Channel) {
+    init(channel: any Channel, http3Connection: HTTP3Connection<LightweightHTTP3Consumer>) {
         self.eventLoop = channel.eventLoop
         self.channel = channel
-        self.requests = LightweightHTTP3Queue(eventLoop: channel.eventLoop)
+        self.requests = LightweightHTTP3Queue()
+        self.http3Connection = NIOLoopBound(http3Connection, eventLoop: channel.eventLoop)
         channel.closeFuture.whenComplete { [requests] _ in
             requests.finish()
         }
     }
 }
 
-/// A request stream, between the consumer, which reads and writes it, and the task that runs its handler.
+/// A request stream, between the consumer, which reads and writes it on the connection's event loop, and the task
+/// that runs its handler, which may run anywhere.
 ///
-/// Confined to the connection's event loop: the handler's task runs on it.
+/// They share the state behind ``state``. The stream itself is only touched on the event loop: directly if the
+/// handler's task runs there, after a hop otherwise.
 @available(anyAppleOS 27.0, *)
-final class LightweightHTTP3Request: @unchecked Sendable {
+final class LightweightHTTP3Request: Sendable {
     /// Reading pauses once this much of the body is waiting for the handler.
     static var maximumBufferedBodyBytes: Int { 256 * 1024 }
     /// Written body bytes are sent straight away once this many are waiting.
     static var flushThreshold: Int { 64 * 1024 }
 
+    /// What the handler wrote, and which isn't sent yet.
+    private struct PendingWrites {
+        var informational: [HTTPResponse] = []
+        var head: HTTPResponse?
+        var body: [ByteBuffer] = []
+        var bodyBytes = 0
+        var end = false
+        var trailers: HTTPFields?
+
+        var isEmpty: Bool {
+            self.head == nil && self.informational.isEmpty && self.body.isEmpty && !self.end
+        }
+    }
+
+    private struct State {
+        // Inbound
+        var body = ByteBuffer()
+        var receivedEnd = false
+        var deliveredEnd = false
+        var trailers: HTTPFields?
+        var readError: (any Error)?
+        var readWaiter: UnsafeContinuation<Void, Never>?
+        var isReadingPaused = false
+
+        // Outbound
+        var pending = PendingWrites()
+        var isFlushScheduled = false
+        var writeError: (any Error)?
+        var finishedWriting = false
+
+        // Lifecycle
+        var isClosed = false
+        /// Whether ``LightweightHTTP3Request/task`` is set.
+        var hasTask = false
+        /// Set while the event loop cancels the handler's task: the task must not end until it's done.
+        var isCancellingTask = false
+        /// The handler's task, waiting for the cancellation to be done before it ends.
+        var cancellationWaiter: UnsafeContinuation<Void, Never>?
+
+        var hasReadableEvent: Bool {
+            self.body.readableBytes > 0 || self.receivedEnd || self.readError != nil
+        }
+    }
+
+    /// When to send what the handler wrote.
+    private enum Flush {
+        /// Not until there's more.
+        case later
+        /// Soon, after the handler had the chance to write more.
+        case soon
+        /// Straight away.
+        case now
+    }
+
+    /// What to do once the lock is released.
+    private enum FlushAction {
+        case none
+        case flushNow
+        case scheduleFlush
+    }
+
     let handle: QUICStreamHandle
     unowned let connection: LightweightHTTP3Connection
-
-    // Inbound
-    var body = ByteBuffer()
-    private var receivedEnd = false
-    private var deliveredEnd = false
-    private var trailers: HTTPFields?
-    private var readError: (any Error)?
-    private var readWaiter: UnsafeContinuation<Void, any Error>?
-    private var isReadingPaused = false
-
-    // Outbound
-    private var pendingHead: HTTPResponse?
-    private var pendingInformational: [HTTPResponse] = []
-    private var pendingBody: [ByteBuffer] = []
-    private var pendingBodyBytes = 0
-    private var pendingEnd = false
-    private var pendingTrailers: HTTPFields?
-    private var isFlushScheduled = false
-    private var writeError: (any Error)?
-    private(set) var finishedWriting = false
-
-    // Lifecycle
-    private var isClosed = false
-    private var task: UnsafeCurrentTask?
+    private let state = Mutex(State())
+    /// The handler's task, while it runs, so the event loop can cancel it if the client goes away.
+    ///
+    /// Only touched with ``state`` locked. It's outside of ``state`` because `UnsafeCurrentTask` isn't `Sendable`,
+    /// and there's no `Sendable` way to cancel a child task from outside. Cancelling a task is safe from any thread,
+    /// as long as the task is alive: ``State/isCancellingTask`` keeps it from ending while it's cancelled.
+    private nonisolated(unsafe) var task: UnsafeCurrentTask?
 
     init(handle: QUICStreamHandle, connection: LightweightHTTP3Connection) {
         self.handle = handle
@@ -165,147 +220,377 @@ final class LightweightHTTP3Request: @unchecked Sendable {
 
     var eventLoop: any EventLoop { self.connection.eventLoop }
 
-    // MARK: Consumer side
+    // MARK: Consumer side, on the event loop
 
     /// Takes body bytes the consumer read, returning how many it took.
     func receivedBody(_ bytes: borrowing RawSpan) -> Int {
-        let room = Self.maximumBufferedBodyBytes - self.body.readableBytes
-        guard room > 0 else {
-            self.isReadingPaused = true
-            return 0
+        self.state.withLock { state in
+            let room = Self.maximumBufferedBodyBytes - state.body.readableBytes
+            guard room > 0 else {
+                state.isReadingPaused = true
+                return 0
+            }
+            let taken = min(room, bytes.byteCount)
+            unsafe bytes.extracting(0..<taken).withUnsafeBytes { _ = state.body.writeBytes($0) }
+            return taken
         }
-        let taken = min(room, bytes.byteCount)
-        unsafe bytes.extracting(0..<taken).withUnsafeBytes { _ = self.body.writeBytes($0) }
-        return taken
     }
 
     func receivedEnd(trailers: HTTPFields?) {
-        self.receivedEnd = true
-        self.trailers = trailers
+        self.state.withLock { state in
+            state.receivedEnd = true
+            state.trailers = trailers
+        }
     }
 
     func readFailed(_ error: any Error) {
-        if self.readError == nil {
-            self.readError = error
+        self.state.withLock { state in
+            if state.readError == nil {
+                state.readError = error
+            }
         }
     }
 
     /// Wakes the handler if it's waiting for the request.
     func wakeReader() {
-        guard let waiter = self.readWaiter.take() else { return }
-        if let error = self.readError {
-            waiter.resume(throwing: error)
-        } else {
-            waiter.resume()
-        }
+        let waiter = self.state.withLock { $0.readWaiter.take() }
+        waiter?.resume()
     }
 
     func streamClosed(error: (any Error)?) {
-        self.isClosed = true
-        if !self.receivedEnd {
-            self.readFailed(error ?? ChannelError.eof)
+        let (waiter, cancelTask) = self.state.withLock { state in
+            state.isClosed = true
+            if !state.receivedEnd && state.readError == nil {
+                state.readError = error ?? ChannelError.eof
+            }
+            // The client went away before it got the whole response: cancel the handler, like the channel-based
+            // path does.
+            let cancelTask = !state.finishedWriting && state.hasTask
+            if cancelTask {
+                state.isCancellingTask = true
+            }
+            return (state.readWaiter.take(), cancelTask)
         }
-        self.wakeReader()
-        // The client went away before it got the whole response: cancel the handler, like the channel-based
-        // path does.
-        if !self.finishedWriting {
-            self.task?.cancel()
+        waiter?.resume()
+
+        if cancelTask {
+            // Outside of the lock: cancellation handlers run synchronously, and may come back here. The task can't
+            // end before `isCancellingTask` is cleared, and doesn't touch `task` until then.
+            unsafe self.task?.cancel()
+            let cancellationWaiter = self.state.withLock { state in
+                state.isCancellingTask = false
+                return state.cancellationWaiter.take()
+            }
+            cancellationWaiter?.resume()
         }
     }
 
-    // MARK: Handler side
+    // MARK: Handler side, anywhere
 
+    /// Called by the handler's task, before it runs the handler.
     func attach(task: UnsafeCurrentTask?) {
-        self.task = task
+        let isClosed = self.state.withLock { state in
+            if state.isClosed {
+                return !state.finishedWriting
+            }
+            unsafe self.task = unsafe task
+            state.hasTask = true
+            return false
+        }
+        if isClosed {
+            // The client went away before the handler started.
+            unsafe task?.cancel()
+        }
     }
 
-    func detach() {
-        self.task = nil
+    /// Called by the handler's task once the handler returned: a response it didn't finish is cancelled.
+    func handlerReturned() async {
+        let (mustWait, cancelStream) = self.state.withLock { state in
+            let cancelStream = !state.finishedWriting
+            if cancelStream {
+                state.finishedWriting = true
+                state.pending = PendingWrites()
+            }
+            // While the event loop cancels the task, it uses `task`: it's cleared once it's done.
+            if !state.isCancellingTask {
+                state.hasTask = false
+                unsafe self.task = nil
+            }
+            return (state.isCancellingTask, cancelStream)
+        }
+
+        if mustWait {
+            // The event loop is cancelling the task: it can't end before it's done.
+            await withUnsafeContinuation { continuation in
+                let isCancelled = self.state.withLock { state in
+                    if state.isCancellingTask {
+                        state.cancellationWaiter = continuation
+                        return false
+                    }
+                    return true
+                }
+                if isCancelled {
+                    continuation.resume()
+                }
+            }
+            self.state.withLock { state in
+                state.hasTask = false
+                unsafe self.task = nil
+            }
+        }
+
+        if cancelStream {
+            if self.eventLoop.inEventLoop {
+                self.cancelStreamOnEventLoop()
+            } else {
+                self.eventLoop.execute {
+                    self.cancelStreamOnEventLoop()
+                }
+            }
+        }
     }
 
     /// The next part of the request body: a `.body` or the `.end`. `nil` once the end was delivered.
     func read() async throws -> HTTPRequestPart? {
-        self.eventLoop.assertInEventLoop()
+        enum ReadAction {
+            case body(ByteBuffer, resumeReading: Bool)
+            case end(HTTPFields?)
+            case delivered
+            case fail(any Error)
+            case wait(FlushAction)
+        }
+
         while true {
-            if self.body.readableBytes > 0 {
-                let body = self.body
-                self.body = ByteBuffer()
-                if self.isReadingPaused {
+            let inEventLoop = self.eventLoop.inEventLoop
+            let action = self.state.withLock { state -> ReadAction in
+                if state.body.readableBytes > 0 {
+                    let body = state.body
+                    state.body = ByteBuffer()
+                    let resumeReading = state.isReadingPaused
+                    state.isReadingPaused = false
+                    return .body(body, resumeReading: resumeReading)
+                }
+                if state.receivedEnd {
+                    if state.deliveredEnd {
+                        return .delivered
+                    }
+                    state.deliveredEnd = true
+                    return .end(state.trailers)
+                }
+                if let error = state.readError {
+                    return .fail(error)
+                }
+                // Send whatever the handler has written before waiting for the client.
+                return .wait(Self.flushAction(&state, flush: .now, inEventLoop: inEventLoop))
+            }
+
+            switch action {
+            case .body(let body, let resumeReading):
+                if resumeReading {
                     self.resumeReading()
                 }
                 return .body(body)
-            }
-            if self.receivedEnd {
-                if self.deliveredEnd {
-                    return nil
-                }
-                self.deliveredEnd = true
-                return .end(self.trailers)
-            }
-            if let error = self.readError {
+            case .end(let trailers):
+                return .end(trailers)
+            case .delivered:
+                return nil
+            case .fail(let error):
                 throw error
-            }
-            // Send whatever the handler has written before waiting for the client.
-            try self.flush()
-            try await withUnsafeThrowingContinuation { continuation in
-                self.readWaiter = continuation
+            case .wait(let flushAction):
+                try self.perform(flushAction)
+                await withUnsafeContinuation { continuation in
+                    let isReadable = self.state.withLock { state in
+                        if state.hasReadableEvent {
+                            return true
+                        }
+                        state.readWaiter = continuation
+                        return false
+                    }
+                    if isReadable {
+                        continuation.resume()
+                    }
+                }
             }
         }
     }
 
     private func resumeReading() {
-        self.isReadingPaused = false
-        _ = try? self.connection.http3Connection.withRequest(self.handle) { request, stream in
+        if self.eventLoop.inEventLoop {
+            self.resumeReadingOnEventLoop()
+        } else {
+            self.eventLoop.execute {
+                self.resumeReadingOnEventLoop()
+            }
+        }
+    }
+
+    func sendInformational(_ response: HTTPResponse) throws {
+        try self.enqueue(flush: .now) { pending in
+            pending.informational.append(response)
+        }
+    }
+
+    func sendHead(_ response: HTTPResponse) throws {
+        // Held back until there's more to send, so a whole response goes out together.
+        try self.enqueue(flush: .later) { pending in
+            pending.head = response
+        }
+    }
+
+    func write(_ body: ByteBuffer) throws {
+        guard body.readableBytes > 0 else {
+            try self.enqueue(flush: .later) { _ in }
+            return
+        }
+        // A handler which writes and finishes without suspending is flushed by `finish`, before the flush runs.
+        try self.enqueue(flush: .soon) { pending in
+            pending.body.append(body)
+            pending.bodyBytes += body.readableBytes
+        }
+    }
+
+    /// Sends the end of the response, after `body` if it isn't `nil`.
+    func finish(body: ByteBuffer? = nil, trailers: HTTPFields?) throws {
+        try self.enqueue(flush: .now) { pending in
+            if let body, body.readableBytes > 0 {
+                pending.body.append(body)
+                pending.bodyBytes += body.readableBytes
+            }
+            pending.end = true
+            pending.trailers = trailers
+        }
+    }
+
+    /// Sends a whole response.
+    func sendResponse(_ response: HTTPResponse, body: ByteBuffer?, trailers: HTTPFields?) throws {
+        try self.enqueue(flush: .now) { pending in
+            pending.head = response
+            if let body, body.readableBytes > 0 {
+                pending.body.append(body)
+                pending.bodyBytes += body.readableBytes
+            }
+            pending.end = true
+            pending.trailers = trailers
+        }
+    }
+
+    /// Resets the stream and asks the client to stop sending.
+    func abort(resetCode: QUICApplicationErrorCode, stopSendingCode: QUICApplicationErrorCode) {
+        self.state.withLock { state in
+            state.finishedWriting = true
+            state.pending = PendingWrites()
+        }
+        if self.eventLoop.inEventLoop {
+            self.resetOnEventLoop(resetCode: resetCode, stopSendingCode: stopSendingCode)
+        } else {
+            self.eventLoop.execute {
+                self.resetOnEventLoop(resetCode: resetCode, stopSendingCode: stopSendingCode)
+            }
+        }
+    }
+
+    /// Adds to what's waiting to be sent, and sends it as `flush` says.
+    private func enqueue(flush: Flush, _ update: (inout PendingWrites) -> Void) throws {
+        let inEventLoop = self.eventLoop.inEventLoop
+        let action = try self.state.withLock { state throws -> FlushAction in
+            if let error = state.writeError {
+                throw error
+            }
+            // Also once the response was finished, aborted or cancelled: nothing more goes out then.
+            if state.isClosed || state.finishedWriting {
+                throw ChannelError.ioOnClosedChannel
+            }
+            update(&state.pending)
+            if state.pending.end {
+                state.finishedWriting = true
+            }
+            let effectiveFlush = state.pending.bodyBytes >= Self.flushThreshold ? .now : flush
+            return Self.flushAction(&state, flush: effectiveFlush, inEventLoop: inEventLoop)
+        }
+        try self.perform(action)
+    }
+
+    /// What to do to send the pending writes as `flush` says. Off the event loop, they're always sent after a hop,
+    /// which picks up whatever was written in the meantime.
+    private static func flushAction(_ state: inout State, flush: Flush, inEventLoop: Bool) -> FlushAction {
+        if state.pending.isEmpty || flush == .later {
+            return .none
+        }
+        if inEventLoop && flush == .now {
+            return .flushNow
+        }
+        if state.isFlushScheduled {
+            return .none
+        }
+        state.isFlushScheduled = true
+        return .scheduleFlush
+    }
+
+    private func perform(_ action: FlushAction) throws {
+        switch action {
+        case .none:
+            ()
+        case .flushNow:
+            try self.flushOnEventLoop()
+        case .scheduleFlush:
+            self.eventLoop.execute {
+                // Failures are thrown by the handler's next write.
+                try? self.flushOnEventLoop(isScheduled: true)
+            }
+        }
+    }
+
+    // MARK: On the event loop
+
+    /// Sends everything written so far, in one go.
+    private func flushOnEventLoop(isScheduled: Bool = false) throws {
+        let pending = self.state.withLock { state in
+            if isScheduled {
+                state.isFlushScheduled = false
+            }
+            let pending = state.pending
+            state.pending = PendingWrites()
+            return pending
+        }
+        guard !pending.isEmpty else { return }
+
+        do {
+            let sent: Void? = try self.connection.http3Connection.value.withRequest(self.handle) { request, stream in
+                for informational in pending.informational {
+                    try request.writeResponseHead(informational, to: &stream)
+                }
+                if let head = pending.head {
+                    try request.writeResponseHead(head, to: &stream)
+                }
+                for body in pending.body {
+                    try request.writeBody(body, to: &stream)
+                }
+                if pending.end {
+                    try request.writeEnd(trailers: pending.trailers, to: &stream)
+                }
+            }
+            if sent == nil {
+                throw ChannelError.ioOnClosedChannel
+            }
+        } catch {
+            self.state.withLock { state in
+                if state.writeError == nil {
+                    state.writeError = error
+                }
+            }
+            throw error
+        }
+    }
+
+    private func resumeReadingOnEventLoop() {
+        _ = try? self.connection.http3Connection.value.withRequest(self.handle) { request, stream in
             request.resumeReading()
             LightweightHTTP3Consumer.readRequest(&request, stream: &stream, connection: self.connection)
         }
     }
 
-    func sendInformational(_ response: HTTPResponse) throws {
-        try self.checkWritable()
-        self.pendingInformational.append(response)
-        try self.flush()
-    }
-
-    func sendHead(_ response: HTTPResponse) throws {
-        try self.checkWritable()
-        // Held back until there's more to send, so a whole response goes out together.
-        self.pendingHead = response
-    }
-
-    func write(_ body: ByteBuffer) throws {
-        try self.checkWritable()
-        guard body.readableBytes > 0 else { return }
-        self.pendingBody.append(body)
-        self.pendingBodyBytes += body.readableBytes
-        if self.pendingBodyBytes >= Self.flushThreshold {
-            try self.flush()
-        } else if !self.isFlushScheduled {
-            // A handler which writes and finishes without suspending is flushed by `finish`, before this runs.
-            self.isFlushScheduled = true
-            self.eventLoop.execute {
-                self.isFlushScheduled = false
-                do {
-                    try self.flush()
-                } catch {
-                    self.writeError = error
-                }
-            }
-        }
-    }
-
-    func finish(trailers: HTTPFields?) throws {
-        try self.checkWritable()
-        self.pendingEnd = true
-        self.pendingTrailers = trailers
-        self.finishedWriting = true
-        try self.flush()
-    }
-
-    /// Resets the stream and asks the client to stop sending.
-    func abort(resetCode: QUICApplicationErrorCode, stopSendingCode: QUICApplicationErrorCode) {
-        self.finishedWriting = true
-        _ = try? self.connection.http3Connection.withRequest(self.handle) { _, stream in
+    private func resetOnEventLoop(resetCode: QUICApplicationErrorCode, stopSendingCode: QUICApplicationErrorCode) {
+        _ = try? self.connection.http3Connection.value.withRequest(self.handle) { _, stream in
             if stream.isReceiveOpen {
                 stream.sendStopSending(code: stopSendingCode)
             }
@@ -315,52 +600,9 @@ final class LightweightHTTP3Request: @unchecked Sendable {
         }
     }
 
-    /// Called when the handler returned: a response it didn't finish is cancelled.
-    func handlerReturned() {
-        if !self.finishedWriting {
-            self.finishedWriting = true
-            _ = try? self.connection.http3Connection.withRequest(self.handle) { request, stream in
-                request.cancel(stream: &stream)
-            }
-        }
-    }
-
-    private func checkWritable() throws {
-        if let error = self.writeError {
-            throw error
-        }
-        if self.isClosed {
-            throw ChannelError.ioOnClosedChannel
-        }
-    }
-
-    private var hasPendingWrites: Bool {
-        self.pendingHead != nil || !self.pendingInformational.isEmpty || !self.pendingBody.isEmpty || self.pendingEnd
-    }
-
-    /// Sends everything written so far, in one go.
-    func flush() throws {
-        guard self.hasPendingWrites else { return }
-        let sent: Void? = try self.connection.http3Connection.withRequest(self.handle) { request, stream in
-            for informational in self.pendingInformational {
-                try request.writeResponseHead(informational, to: &stream)
-            }
-            self.pendingInformational.removeAll(keepingCapacity: true)
-            if let head = self.pendingHead.take() {
-                try request.writeResponseHead(head, to: &stream)
-            }
-            for body in self.pendingBody {
-                try request.writeBody(body, to: &stream)
-            }
-            self.pendingBody.removeAll(keepingCapacity: true)
-            self.pendingBodyBytes = 0
-            if self.pendingEnd {
-                self.pendingEnd = false
-                try request.writeEnd(trailers: self.pendingTrailers.take(), to: &stream)
-            }
-        }
-        if sent == nil {
-            throw ChannelError.ioOnClosedChannel
+    private func cancelStreamOnEventLoop() {
+        _ = try? self.connection.http3Connection.value.withRequest(self.handle) { request, stream in
+            request.cancel(stream: &stream)
         }
     }
 }
@@ -430,22 +672,22 @@ extension NIOHTTPServer {
         addressContinuation: AsyncThrowingStream<NIOCore.SocketAddress, any Error>.Continuation,
         connectionHandler: Handler
     ) {
-        let executor = EventLoopTaskExecutor(eventLoop: eventLoop)
-        group.addTask(name: "HTTP/3 (lightweight streams) over \(address) on \(eventLoop)") {
-            // Everything below, down to the request handlers, runs on the event loop.
-            try await withTaskExecutorPreference(executor) {
-                try await self.withLightweightHTTP3Channel(
-                    address: address,
-                    eventLoop: eventLoop,
-                    socket: socket,
-                    configuration: configuration,
-                    addressContinuation: addressContinuation
-                ) { connections in
-                    await withDiscardingTaskGroup { connectionGroup in
-                        while let connection = await connections.next() {
-                            connectionGroup.addTask {
-                                await self.dispatchLightweightHTTP3Connection(connection, handler: connectionHandler)
-                            }
+        group.addTask(
+            name: "HTTP/3 (lightweight streams) over \(address) on \(eventLoop)",
+            // Everything below, down to the request handlers, runs on the event loop, if it's a task executor.
+            executorPreference: eventLoop as? any TaskExecutor
+        ) {
+            try await self.withLightweightHTTP3Channel(
+                address: address,
+                eventLoop: eventLoop,
+                socket: socket,
+                configuration: configuration,
+                addressContinuation: addressContinuation
+            ) { connections in
+                await withDiscardingTaskGroup { connectionGroup in
+                    while let connection = await connections.next() {
+                        connectionGroup.addTask {
+                            await self.dispatchLightweightHTTP3Connection(connection, handler: connectionHandler)
                         }
                     }
                 }
@@ -475,7 +717,7 @@ extension NIOHTTPServer {
         }
     }
 
-    /// Runs each request of the connection in a child task, on the connection's event loop.
+    /// Runs each request of the connection in a child task.
     func handleLightweightHTTP3Connection<Handler: HTTPServerRequestHandler>(
         connection: LightweightHTTP3Connection,
         handler: Handler,
@@ -525,8 +767,7 @@ extension NIOHTTPServer {
             handler: handler
         )
 
-        stream.detach()
-        stream.handlerReturned()
+        await stream.handlerReturned()
     }
 
     /// Binds the QUIC listener, and runs `body` with the queue of its connections. The socket is closed when `body`
@@ -628,7 +869,7 @@ extension NIOHTTPServer {
         configuration: ListenerConfiguration.HTTP3,
         socket: HTTP3ListenerSocket
     ) throws -> LightweightHTTP3Queue<LightweightHTTP3Connection> {
-        let connections = LightweightHTTP3Queue<LightweightHTTP3Connection>(eventLoop: channel.eventLoop)
+        let connections = LightweightHTTP3Queue<LightweightHTTP3Connection>()
         channel.closeFuture.whenComplete { _ in
             connections.finish()
         }
@@ -656,14 +897,17 @@ extension NIOHTTPServer {
             logger: logger,
             connectionIDGenerator: connectionIDGenerator
         ) { quicConnection in
-            let connection = LightweightHTTP3Connection(channel: quicConnection.channel)
-            let consumer = LightweightHTTP3Consumer(
-                http3Connection: .server(quicConnection, settings: settings, logger: logger),
-                connection: connection
+            let http3Connection = HTTP3Connection<LightweightHTTP3Consumer>.server(
+                quicConnection,
+                settings: settings,
+                logger: logger
             )
-            connection.http3Connection = consumer.http3Connection
+            let connection = LightweightHTTP3Connection(
+                channel: quicConnection.channel,
+                http3Connection: http3Connection
+            )
             connections.yield(connection)
-            return consumer
+            return LightweightHTTP3Consumer(http3Connection: http3Connection, connection: connection)
         }
 
         try channel.pipeline.syncOperations.addHandler(quicHandler)
