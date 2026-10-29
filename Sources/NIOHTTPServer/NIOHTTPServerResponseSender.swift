@@ -99,11 +99,8 @@ extension NIOHTTPServer {
             precondition(response.status.kind != .informational)
             #if HTTP3
             if let lightweightHTTP3Request = self.lightweightHTTP3Request {
-                try lightweightHTTP3Request.sendHead(response)
-                if !buffer.isEmpty {
-                    try lightweightHTTP3Request.write(ByteBuffer(draining: &buffer))
-                }
-                try lightweightHTTP3Request.finish(trailers: trailer)
+                let body = buffer.isEmpty ? nil : ByteBuffer(draining: &buffer)
+                try lightweightHTTP3Request.sendResponse(response, body: body, trailers: trailer)
                 self.writerState.wrapped.withLock { $0.finishedWriting = true }
                 return
             }
@@ -193,10 +190,8 @@ extension NIOHTTPServer.ResponseSender {
         ) async throws(WriteFailure) {
             #if HTTP3
             if let lightweightHTTP3Request = self.lightweightHTTP3Request {
-                if !buffer.isEmpty {
-                    try lightweightHTTP3Request.write(ByteBuffer(draining: &buffer))
-                }
-                try lightweightHTTP3Request.finish(trailers: finalElement)
+                let body = buffer.isEmpty ? nil : ByteBuffer(draining: &buffer)
+                try lightweightHTTP3Request.finish(body: body, trailers: finalElement)
                 self.writerState.wrapped.withLock { $0.finishedWriting = true }
                 return
             }
