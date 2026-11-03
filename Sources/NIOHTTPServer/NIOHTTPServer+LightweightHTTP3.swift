@@ -43,9 +43,9 @@ import Synchronization
 /// A single consumer queue: the producer is the event loop, the consumer a task which runs anywhere.
 @available(anyAppleOS 27.0, *)
 final class LightweightHTTP3Queue<Element: Sendable>: Sendable {
-    private struct State {
+    private struct State: ~Copyable {
         var pending = CircularBuffer<Element>()
-        var waiter: UnsafeContinuation<Element?, Never>?
+        var waiter: Continuation<Element?, Never>?
         var isFinished = false
     }
 
@@ -54,12 +54,12 @@ final class LightweightHTTP3Queue<Element: Sendable>: Sendable {
     init() {}
 
     func yield(_ element: Element) {
-        let waiter = self.state.withLock { state -> UnsafeContinuation<Element?, Never>? in
-            if let waiter = state.waiter.take() {
-                return waiter
+        let waiter = self.state.withLock { state in
+            let waiter = state.waiter.take()
+            if waiter == nil {
+                state.pending.append(element)
             }
-            state.pending.append(element)
-            return nil
+            return waiter
         }
         waiter?.resume(returning: element)
     }
@@ -86,7 +86,8 @@ final class LightweightHTTP3Queue<Element: Sendable>: Sendable {
         if let next {
             return next
         }
-        return await withUnsafeContinuation { continuation in
+        return await withContinuation(of: Element?.self) { continuation in
+            var continuation = Optional(continuation)
             let next = self.state.withLock { state -> Element?? in
                 if let element = state.pending.popFirst() {
                     return element
@@ -95,11 +96,11 @@ final class LightweightHTTP3Queue<Element: Sendable>: Sendable {
                     return .some(nil)
                 }
                 precondition(state.waiter == nil, "\(Self.self) only has a single consumer")
-                state.waiter = continuation
+                state.waiter = continuation.take()
                 return nil
             }
             if let next {
-                continuation.resume(returning: next)
+                continuation?.resume(returning: next)
             }
         }
     }
@@ -156,14 +157,14 @@ final class LightweightHTTP3Request: Sendable {
         }
     }
 
-    private struct State {
+    private struct State: ~Copyable {
         // Inbound
         var body = ByteBuffer()
         var receivedEnd = false
         var deliveredEnd = false
         var trailers: HTTPFields?
         var readError: (any Error)?
-        var readWaiter: UnsafeContinuation<Void, Never>?
+        var readWaiter: Continuation<Void, Never>?
         var isReadingPaused = false
 
         // Outbound
@@ -179,7 +180,7 @@ final class LightweightHTTP3Request: Sendable {
         /// Set while the event loop cancels the handler's task: the task must not end until it's done.
         var isCancellingTask = false
         /// The handler's task, waiting for the cancellation to be done before it ends.
-        var cancellationWaiter: UnsafeContinuation<Void, Never>?
+        var cancellationWaiter: Continuation<Void, Never>?
 
         var hasReadableEvent: Bool {
             self.body.readableBytes > 0 || self.receivedEnd || self.readError != nil
@@ -231,7 +232,7 @@ final class LightweightHTTP3Request: Sendable {
                 return 0
             }
             let taken = min(room, bytes.byteCount)
-            unsafe bytes.extracting(0..<taken).withUnsafeBytes { _ = state.body.writeBytes($0) }
+            bytes.extracting(0..<taken).withUnsafeBytes { _ = unsafe state.body.writeBytes($0) }
             return taken
         }
     }
@@ -258,18 +259,19 @@ final class LightweightHTTP3Request: Sendable {
     }
 
     func streamClosed(error: (any Error)?) {
-        let (waiter, cancelTask) = self.state.withLock { state in
+        var cancelTask = false
+        let waiter = self.state.withLock { state in
             state.isClosed = true
             if !state.receivedEnd && state.readError == nil {
                 state.readError = error ?? ChannelError.eof
             }
             // The client went away before it got the whole response: cancel the handler, like the channel-based
             // path does.
-            let cancelTask = !state.finishedWriting && state.hasTask
+            cancelTask = !state.finishedWriting && state.hasTask
             if cancelTask {
                 state.isCancellingTask = true
             }
-            return (state.readWaiter.take(), cancelTask)
+            return state.readWaiter.take()
         }
         waiter?.resume()
 
@@ -321,17 +323,15 @@ final class LightweightHTTP3Request: Sendable {
 
         if mustWait {
             // The event loop is cancelling the task: it can't end before it's done.
-            await withUnsafeContinuation { continuation in
-                let isCancelled = self.state.withLock { state in
+            await withContinuation(of: Void.self) { continuation in
+                var continuation = Optional(continuation)
+                self.state.withLock { state in
                     if state.isCancellingTask {
-                        state.cancellationWaiter = continuation
-                        return false
+                        state.cancellationWaiter = continuation.take()
                     }
-                    return true
                 }
-                if isCancelled {
-                    continuation.resume()
-                }
+                // Already done.
+                continuation?.resume()
             }
             self.state.withLock { state in
                 state.hasTask = false
@@ -398,17 +398,15 @@ final class LightweightHTTP3Request: Sendable {
                 throw error
             case .wait(let flushAction):
                 try self.perform(flushAction)
-                await withUnsafeContinuation { continuation in
-                    let isReadable = self.state.withLock { state in
-                        if state.hasReadableEvent {
-                            return true
+                await withContinuation(of: Void.self) { continuation in
+                    var continuation = Optional(continuation)
+                    self.state.withLock { state in
+                        if !state.hasReadableEvent {
+                            state.readWaiter = continuation.take()
                         }
-                        state.readWaiter = continuation
-                        return false
                     }
-                    if isReadable {
-                        continuation.resume()
-                    }
+                    // Readable already.
+                    continuation?.resume()
                 }
             }
         }
