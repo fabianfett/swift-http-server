@@ -108,7 +108,7 @@ let package = Package(
         // branch pins the same revision, and SwiftPM rejects two different revision-based requirements.
         .package(
             url: "https://github.com/fabianfett/swift-nio-http3.git",
-            revision: "d8c005f82cf9d62d160284424f2fe668faace2dc"
+            branch: "lightweight-http3-streams"
         ),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.37.0"),
         .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.35.1"),
